@@ -9,6 +9,10 @@ import (
 // defaultMaxExpansions 是默认的节点展开预算（确定性地替代墙上时钟“超时”）。
 const defaultMaxExpansions = 1_000_000
 
+// clockCheckInterval 是墙上时钟检查的展开粒度：不在每个节点上读时钟，
+// 降低系统调用开销；确定性虚拟时钟同样按此粒度推进。
+const clockCheckInterval = 256
+
 // Planner 是有确定展开预算的全局 A* 规划器。
 //
 // 确定性保证：
@@ -19,6 +23,12 @@ const defaultMaxExpansions = 1_000_000
 type Planner struct {
 	maxExpansions int
 	expansions    int
+
+	// deadline>0 时启用墙上时钟兜底：deadline 为相对微秒数，
+	// startMicros 在每次 Plan 开始时记录；clock 为 nil 表示不启用。
+	deadline    int64
+	clock       Clock
+	startMicros int64
 }
 
 // New 创建规划器；maxExpansions<=0 表示使用默认预算。
@@ -51,6 +61,9 @@ func (p *Planner) Plan(g *grid.Grid, start, goal grid.Cell) ([]grid.Cell, error)
 	if start == goal {
 		return []grid.Cell{start}, nil
 	}
+	if p.clock != nil {
+		p.startMicros = p.clock.NowMicros()
+	}
 
 	gScore := map[grid.Cell]int{start: 0}
 	cameFrom := map[grid.Cell]grid.Cell{}
@@ -71,6 +84,10 @@ func (p *Planner) Plan(g *grid.Grid, start, goal grid.Cell) ([]grid.Cell, error)
 		p.expansions++
 		if p.expansions > p.maxExpansions {
 			return nil, ErrPlanLimit
+		}
+		if p.clock != nil && p.expansions%clockCheckInterval == 0 &&
+			p.clock.NowMicros()-p.startMicros >= p.deadline {
+			return nil, ErrPlanTimeout
 		}
 		if c == goal {
 			return reconstruct(cameFrom, c), nil

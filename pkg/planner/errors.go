@@ -12,4 +12,5 @@ var (
 	ErrGoalOccupied     = errors.New("planner: goal cell is occupied")
 	ErrUnreachable      = errors.New("planner: goal is unreachable")
 	ErrPlanLimit        = errors.New("planner: expansion budget exhausted")
+	ErrPlanTimeout      = errors.New("planner: wall-clock deadline exceeded")
 )

@@ -25,9 +25,10 @@ const (
 	StatusReplanned                  // 遇障后重规划成功
 	StatusRejected                   // 输入非法，详见 Reason
 	StatusUnreachable                // 目标不可达
-	StatusPlanLimit                  // 超出规划预算/时限
+	StatusPlanLimit                  // 超出确定性展开预算
+	StatusTimeout                    // 超出墙上时钟规划时限（实时兜底）
 	StatusConstraintViolation        // 轨迹违反运动学约束
-	StatusBlocked                    // 局部窗口堵死且无替代路径
+	StatusBlocked                    // 局部窗口堵死/终检仍碰撞且无替代路径
 )
 
 // String 返回状态的可读名称（用于日志与判定依据打印）。
@@ -43,6 +44,8 @@ func (s Status) String() string {
 		return "UNREACHABLE"
 	case StatusPlanLimit:
 		return "PLAN_LIMIT"
+	case StatusTimeout:
+		return "TIMEOUT"
 	case StatusConstraintViolation:
 		return "CONSTRAINT_VIOLATION"
 	case StatusBlocked:
@@ -103,6 +106,10 @@ type Navigator struct {
 	mapSeq int64
 	obs    map[string]local.Obstacle
 	obsSeq map[string]int64
+
+	// planPathFn 为测试专用接缝：非 nil 时替代 A* 搜索（模拟规划器/轨迹
+	// 构造器输出与保守膨胀不一致的漂移），生产代码恒为 nil，行为不变。
+	planPathFn func(g *grid.Grid, start, goal grid.Cell) ([]grid.Cell, error)
 }
 
 // New 创建编排器，初始地图可为 nil（后续由 ApplyMap 注入）。
@@ -170,20 +177,42 @@ func (n *Navigator) Snapshot() (*grid.Grid, []local.Obstacle) {
 	return n.snapshot()
 }
 
-// Plan 执行一次全局规划：输入分类 → A* → 轨迹构造 → 约束校验。
-// 不考虑动态障碍物的局部推进（那是 ReplanningStep 的职责）。
+// Plan 执行一次性的完整路线请求。
+//
+// 它与 ReplanningStep 共用同一条规划闭环和同一份世界快照：已通过更新被接受的
+// 动态障碍物一律计入（先在原始静态地图上搜索，再用整条轨迹对所有已知障碍终检，
+// 冲突则膨胀障碍足迹后重规划）。区别仅在于 Plan 不跑 DWA 逐步执行校验，因此
+// 成功/绕行/不可达/拒绝/超时/预算等结论与路线在两个入口间可互相解释。
 func (n *Navigator) Plan(req Request) Result {
-	g, obstacles := n.snapshot()
-	res := n.planOnce(req, g, obstacles, 0)
-	return res
+	return n.runClosedLoop(req, false)
 }
 
-// ReplanningStep 在当前地图+障碍物状态下执行“规划—局部执行—遇障重规划”闭环：
-// 局部窗口被堵或当前路径与动态障碍冲突时，把障碍足迹确定性膨胀到工作地图，
-// 然后重新全局搜索；成功时返回 StatusReplanned（若根本没触发重规划则为 Planned）。
+// ReplanningStep 在当前地图+障碍物状态下执行“规划—终检—局部执行—遇障重规划”
+// 闭环。与 Plan 使用相同的世界快照与终检闸门，额外增加 DWA 逐步可执行性校验：
+// 局部窗口被堵时同样膨胀障碍足迹后重新全局搜索。
+// 成功时若发生过绕行，状态为 REPLANNED（否则 PLANNED）。
 func (n *Navigator) ReplanningStep(req Request) Result {
-	g, obstacles := n.snapshot()
+	return n.runClosedLoop(req, true)
+}
 
+// runClosedLoop 是 Plan 与 ReplanningStep 共享的确定性规划闭环。
+//
+//  1. 基于同一快照（原始地图 + 全部已接受障碍）做一次静态规划；
+//  2. 对“准备下发的整条轨迹”做终检：逐段复核原始地图与所有动态障碍；
+//  3. 逐步入口（rollout=true）再跑 DWA 短步推进验证可执行性；
+//  4. 任一闸门发现冲突：把障碍足迹与碰撞点单元格确定性膨胀进工作地图，重搜；
+//  5. 终检仍碰撞且膨胀不再带来新信息（或重搜次数耗尽）=> BLOCKED，
+//     绝不下发穿过已知障碍的轨迹；其他失败分类（拒绝/不可达/预算/超时）原样透传。
+func (n *Navigator) runClosedLoop(req Request, rollout bool) Result {
+	g, obstacles := n.snapshot()
+	if g == nil {
+		// 输入分类在 planOnce 内统一完成，保持两个入口的拒绝结论一致。
+		return n.planOnce(req, nil, obstacles, 0)
+	}
+	margin := 0.0
+	if n.lp != nil {
+		margin = n.lp.Config().ObstacleMargin
+	}
 	work := g.Clone()
 	var lastRes Result
 	replans := 0
@@ -191,26 +220,82 @@ func (n *Navigator) ReplanningStep(req Request) Result {
 		res := n.planOnce(req, work, obstacles, replans)
 		lastRes = res
 		if res.Status != StatusPlanned {
+			// 终检/执行触发的重规划若以“不可达”告终，保留 UNREACHABLE 分类
+			//（兼容既有语义，两个入口结论一致）；起点被膨胀封死仍为 BLOCKED。
 			return res
 		}
-		// 局部执行校验：沿全局路径逐步滚 DWA，探测动态障碍冲突。
-		blocked, blockerCells := n.localRollout(req.Start, res.Path, work, obstacles)
-		if !blocked {
+
+		// 闸门 1（两个入口共有）：整条交付轨迹对原始静态地图与当前所有
+		// 已知动态障碍逐段终检，而不只看 DWA 局部试探的那一小段。
+		hit, col, _ := n.lp.FirstCollision(res.Traj, g, obstacles)
+		// 闸门 2（仅逐步入口）：DWA 短步推进的可执行性校验。
+		blocked := false
+		var blockerCells []grid.Cell
+		if !hit && rollout {
+			blocked, blockerCells = n.localRollout(req.Start, res.Path, work, obstacles)
+		}
+		if !hit && !blocked {
 			res.Status = statusForAttempt(replans)
 			res.Replans = replans
 			return res
 		}
+
+		// 发现冲突：膨胀障碍足迹（终检碰撞时额外标记碰撞点所在格），然后重搜。
+		newCells := blockerCells
+		if hit {
+			newCells = append(newCells, colCell(col))
+			newCells = append(newCells, obstacleFootprintCells(g, obstacles, margin)...)
+		}
+		added := inflateObstacles(work, dedupCells(newCells))
 		if attempt == maxReplans {
 			break
 		}
-		// 重规划：把堵点障碍膨胀进工作地图后再搜一次。
-		inflateObstacles(work, blockerCells)
+		// 膨胀没有带来任何新的禁行格：再搜一次结论也不会变，直接判死。
+		if added == 0 {
+			break
+		}
 		replans++
 	}
-	lastRes.Status = StatusBlocked
-	lastRes.Reason = fmt.Errorf("nav: local window blocked after %d replans", replans)
-	lastRes.Replans = replans
+	// 用尽重规划次数，最后一次规划“看起来成功”但终检/执行闸门仍未通过：
+	// 判 BLOCKED（带可区分哨兵原因），清掉半成品路线与轨迹。
+	if lastRes.Status == StatusPlanned {
+		lastRes = blockedCollisionResult(lastRes, replans)
+	}
 	return lastRes
+}
+
+// blockedCollisionResult 把“规划看似成功但终检仍碰撞”的结论改写为
+// BLOCKED + ErrTrajectoryCollision，并清除不得下发的半成品路线/轨迹。
+func blockedCollisionResult(res Result, replans int) Result {
+	res.Status = StatusBlocked
+	res.Reason = fmt.Errorf("%w: trajectory still collides after %d replans",
+		ErrTrajectoryCollision, replans)
+	res.Replans = replans
+	res.Path = nil
+	res.Traj = nil
+	return res
+}
+
+// colCell 取终检碰撞段所在栅格（与 local 碰撞检测的取整口径一致）。
+func colCell(col local.Collision) grid.Cell {
+	return grid.Cell{
+		X: int(math.Floor(col.Pose.X + 0.5)),
+		Y: int(math.Floor(col.Pose.Y + 0.5)),
+	}
+}
+
+// dedupCells 对单元格切片去重（顺序无关的确定性集合输入）。
+func dedupCells(cells []grid.Cell) []grid.Cell {
+	seen := map[grid.Cell]bool{}
+	out := cells[:0]
+	for _, c := range cells {
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out
 }
 
 func statusForAttempt(replans int) Status {
@@ -236,8 +321,14 @@ func (n *Navigator) planOnce(req Request, g *grid.Grid, obstacles []local.Obstac
 	startCell := poseToCell(req.Start)
 	res.StartCell = startCell
 
-	path, err := n.gp.Plan(g, startCell, req.Goal)
-	res.Expansions = n.gp.Expansions()
+	var path []grid.Cell
+	var err error
+	if n.planPathFn != nil {
+		path, err = n.planPathFn(g, startCell, req.Goal)
+	} else {
+		path, err = n.gp.Plan(g, startCell, req.Goal)
+		res.Expansions = n.gp.Expansions()
+	}
 	if err != nil {
 		res.Status, res.Reason = classifyPlanError(err, replans)
 		return res
@@ -298,6 +389,8 @@ func classifyPlanError(err error, replans int) (Status, error) {
 		return StatusUnreachable, err
 	case errors.Is(err, planner.ErrPlanLimit):
 		return StatusPlanLimit, err
+	case errors.Is(err, planner.ErrPlanTimeout):
+		return StatusTimeout, err
 	default:
 		// 地图缺失、起终点越界/占据等一律是输入拒绝。
 		// 重规划中起点被膨胀障碍占据意味着机器人已被封死，归类 Blocked。
@@ -308,13 +401,17 @@ func classifyPlanError(err error, replans int) (Status, error) {
 	}
 }
 
-// inflateObstacles 在工作地图上标记障碍物足迹单元格（确定性集合更新）。
-func inflateObstacles(g *grid.Grid, cells []grid.Cell) {
+// inflateObstacles 在工作地图上标记障碍物足迹单元格（确定性集合更新），
+// 返回本次新被标记（原先自由）的单元格数，用于判断重规划是否还有意义。
+func inflateObstacles(g *grid.Grid, cells []grid.Cell) int {
+	added := 0
 	for _, c := range cells {
-		if g.InBounds(c) {
+		if g.InBounds(c) && !g.Occupied(c) {
 			g.Set(c, true)
+			added++
 		}
 	}
+	return added
 }
 
 // obstacleFootprintCells 计算所有圆形障碍（含安全裕度）覆盖的单元格，

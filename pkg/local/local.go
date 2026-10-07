@@ -12,6 +12,7 @@
 package local
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/lisama569/nav-planner-go/pkg/grid"
@@ -217,19 +218,62 @@ func (p *Planner) carrot(start kinematics.Pose, path []grid.Cell) grid.Cell {
 
 // Collides 判断给定轨迹是否与任一障碍物（或占据栅格）碰撞。
 func (p *Planner) Collides(traj *kinematics.Trajectory, g *grid.Grid, obstacles []Obstacle) bool {
+	hit, _, _ := p.FirstCollision(traj, g, obstacles)
+	return hit
+}
+
+// Collision 描述终检发现的首个碰撞点（段号、位姿与原因），用于日志/判定依据。
+type Collision struct {
+	Index int
+	Pose  kinematics.Pose
+	Msg   string
+}
+
+// FirstCollision 对整条轨迹逐点做碰撞终检，返回首个碰撞点（固定从首段起，
+// 结论确定）。检测口径与 DWA 局部试探完全一致：
+//   - 圆形障碍：到障碍中心距离 < 半径+ObstacleMargin；
+//   - 栅格：采样点所在单元格（四舍五入）被占据或越界。
+//
+// 无碰撞时 hit=false。终检覆盖整条轨迹，而不只是局部窗口的一小段。
+func (p *Planner) FirstCollision(traj *kinematics.Trajectory, g *grid.Grid, obstacles []Obstacle) (hit bool, col Collision, collider string) {
 	if traj == nil {
-		return false
+		return false, Collision{}, ""
 	}
-	for _, pt := range traj.Points {
-		if p.clearance(pt.Pose, obstacles) < 0 {
-			return true
+	for i, pt := range traj.Points {
+		if id, d := p.nearestIntruder(pt.Pose, obstacles); id != "" {
+			return true, Collision{
+				Index: i, Pose: pt.Pose,
+				Msg: fmt.Sprintf("segment %d pose (%.3f,%.3f) intrudes obstacle %q by %.3f",
+					i, pt.Pose.X, pt.Pose.Y, id, -d),
+			}, id
 		}
 		cell := grid.Cell{X: int(math.Floor(pt.Pose.X + 0.5)), Y: int(math.Floor(pt.Pose.Y + 0.5))}
-		if g != nil && !g.Free(cell) {
-			return true
+		if g == nil || !g.Free(cell) {
+			reason := "occupied/out-of-bounds cell"
+			if g == nil {
+				reason = "map missing"
+			}
+			return true, Collision{
+				Index: i, Pose: pt.Pose,
+				Msg: fmt.Sprintf("segment %d pose (%.3f,%.3f) enters %s %v",
+					i, pt.Pose.X, pt.Pose.Y, reason, cell),
+			}, "grid:" + cell.String()
 		}
 	}
-	return false
+	return false, Collision{}, ""
+}
+
+// nearestIntruder 返回侵入安全裕度最多的障碍物 ID 与侵入量（负=侵入）。
+func (p *Planner) nearestIntruder(pose kinematics.Pose, obstacles []Obstacle) (string, float64) {
+	worstID := ""
+	worst := 0.0
+	for _, o := range obstacles {
+		d := math.Hypot(pose.X-o.X, pose.Y-o.Y) - o.Radius - p.cfg.ObstacleMargin
+		if d < worst {
+			worst, worstID = d, o.ID
+		}
+	}
+	return worstID, worst
 }
 
 // clearance 返回位姿到最近障碍物表面（已含配置的安全裕度）的距离；负值代表侵入。

@@ -5,7 +5,10 @@
 // 保证并发更新与快照读取不会共享底层数组。
 package grid
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // 地图相关的可区分错误。
 var (
@@ -20,6 +23,9 @@ var (
 type Cell struct {
 	X, Y int
 }
+
+// String 返回可读坐标，用于日志与判定依据打印。
+func (c Cell) String() string { return fmt.Sprintf("(%d,%d)", c.X, c.Y) }
 
 // Grid 是行优先存储的占据栅格，true 表示被占据（障碍）。
 type Grid struct {

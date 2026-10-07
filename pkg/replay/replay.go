@@ -46,6 +46,9 @@ type Event struct {
 	Removed  bool
 	Start    kinematics.Pose
 	Goal     grid.Cell
+	// OneShot 为 true 时 REQUEST 事件走一次性 Plan 入口；
+	// false（默认）走 ReplanningStep。两入口共享同一规划闭环。
+	OneShot bool
 }
 
 // Entry 是事件与其对应结论的一条录制记录。
@@ -93,9 +96,12 @@ func (r *Recorder) Apply(e Event) nav.Result {
 			res.Reason = upErr
 		}
 	case EventRequest:
-		res = r.nav.ReplanningStep(nav.Request{
-			Seq: e.Tick, Tick: e.Tick, Start: e.Start, Goal: e.Goal,
-		})
+		req := nav.Request{Seq: e.Tick, Tick: e.Tick, Start: e.Start, Goal: e.Goal}
+		if e.OneShot {
+			res = r.nav.Plan(req)
+		} else {
+			res = r.nav.ReplanningStep(req)
+		}
 	}
 	r.log.Entries = append(r.log.Entries, Entry{Event: e, Result: res, UpdateErr: upErr})
 	return res

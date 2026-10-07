@@ -14,4 +14,6 @@ var (
 	ErrConstraintViolation = errors.New("nav: trajectory violates kinematic constraints")
 	// ErrNoPlanner 表示编排器缺少必要的规划器组件。
 	ErrNoPlanner = errors.New("nav: planner not configured")
+	// ErrTrajectoryCollision 表示终检发现待下发整条轨迹仍与已知动态障碍/占据栅格冲突。
+	ErrTrajectoryCollision = errors.New("nav: delivered trajectory collides with known obstacle")
 )

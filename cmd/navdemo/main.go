@@ -71,6 +71,50 @@ func main() {
 	bad3 := emptyNav.Plan(nav.Request{Seq: 105, Tick: 6, Start: start, Goal: goal})
 	printResult("⑤c 地图缺失", start, goal, bad3)
 
+	// 6) 入口一致性：同一世界快照下，一次性 Plan 与逐步 ReplanningStep
+	//    必须把已接受的动态障碍同样算进去，结论与路线互相解释得通。
+	fmt.Println("--- 入口一致性（同一世界快照） ---")
+	n2 := newNav()
+	must(n2.ApplyMap(nav.MapUpdate{Seq: 1, Grid: base}), "load map")
+	must(n2.ApplyObstacle(nav.ObstacleUpdate{Seq: 2, Obstacle: mover}), "inject mover")
+	c1 := n2.Plan(nav.Request{Seq: 200, Tick: 2, Start: start, Goal: goal})
+	c2 := n2.ReplanningStep(nav.Request{Seq: 201, Tick: 2, Start: start, Goal: goal})
+	printResult("⑥a 一次性 Plan（已计入 mover 障碍）", start, goal, c1)
+	printResult("⑥b 逐步 ReplanningStep（同一世界）", start, goal, c2)
+	fmt.Printf("入口一致: 状态相同=%v，路径相同=%v\n\n",
+		c1.Status == c2.Status, pathsSame(c1.Path, c2.Path))
+
+	// 7) 终检闸门：直线路径的格中心都自由、但整条直行轨迹会擦到圆形障碍，
+	//    终检必须触发膨胀重规划并交付逐段无碰的绕行轨迹。
+	fmt.Println("--- 下发前整轨迹终检 ---")
+	openMap := grid.New(15, 7)
+	n3 := nav.New(planner.New(0), lp, openMap)
+	must(n3.ApplyMap(nav.MapUpdate{Seq: 1, Grid: openMap}), "load open map")
+	grazer := local.Obstacle{ID: "grazer", X: 7, Y: 3.62, Radius: 0.5, Seq: 2}
+	must(n3.ApplyObstacle(nav.ObstacleUpdate{Seq: 2, Obstacle: grazer}), "inject grazer")
+	fc := n3.Plan(nav.Request{Seq: 300, Tick: 2,
+		Start: kinematics.Pose{X: 1, Y: 3}, Goal: grid.Cell{X: 13, Y: 3}})
+	printResult("⑦ 直路擦障 => 终检驱动重规划绕行", kinematics.Pose{X: 1, Y: 3}, grid.Cell{X: 13, Y: 3}, fc)
+
+	// 8) 规划时限：超大地图 + 极短虚拟时钟时限 => 明确的 TIMEOUT 分类，
+	//    与预算耗尽 PLAN_LIMIT 可区分，且不下发半成品。
+	fmt.Println("--- 规划时限（确定性虚拟时钟演示） ---")
+	bigMap := grid.New(200, 200)
+	bigLP := local.New(local.Config{
+		DT: 0.25, Horizon: 6, VSamples: 3, OmegaSamples: 7,
+		GoalTolerance: 0.4, ObstacleMargin: 0.25, MaxIters: 80,
+	}, cons)
+	limGP := planner.NewWithLimit(planner.Limit{
+		MaxExpansions: 1_000_000, DeadlineMicros: 2000,
+		Clock: planner.NewManualClock(1000), // 确定性虚拟时钟：每 256 次展开推进 1ms
+	})
+	n4 := nav.New(limGP, bigLP, bigMap)
+	must(n4.ApplyMap(nav.MapUpdate{Seq: 1, Grid: bigMap}), "load big map")
+	tres := n4.Plan(nav.Request{Seq: 400, Tick: 1,
+		Start: kinematics.Pose{X: 1, Y: 1}, Goal: grid.Cell{X: 198, Y: 198}})
+	printResult("⑧ 超大地图 + 2ms 虚拟时钟时限", kinematics.Pose{X: 1, Y: 1},
+		grid.Cell{X: 198, Y: 198}, tres)
+
 	// 6) 确定性重放：同一事件序列在全新编排器上逐条比对必须一致
 	fmt.Println("--- 确定性重放校验 ---")
 	rec := replay.NewRecorder(newNav())
@@ -111,6 +155,19 @@ func must(err error, what string) {
 	}
 }
 
+// pathsSame 比较两条路径是否逐格相同（入口一致性演示用）。
+func pathsSame(a, b []grid.Cell) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func printResult(tag string, start kinematics.Pose, goal grid.Cell, r nav.Result) {
 	fmt.Printf("[%s]\n", tag)
 	fmt.Printf("  输入: start=(%.2f,%.2f,th=%.2f) goal=(%d,%d)\n",
@@ -127,7 +184,10 @@ func printResult(tag string, start kinematics.Pose, goal grid.Cell, r nav.Result
 	}
 	verdict := "拒绝/失败（不可下发）"
 	if r.Status == nav.StatusPlanned || r.Status == nav.StatusReplanned {
-		verdict = "有效轨迹（可下发）"
+		verdict = "有效轨迹（可下发，已通过整轨迹障碍终检）"
+	}
+	if r.Status == nav.StatusTimeout || r.Status == nav.StatusPlanLimit {
+		verdict = "规划未完成（超时/预算耗尽，半成品不下发）"
 	}
 	fmt.Printf("  判定依据: %s\n\n", verdict)
 }
