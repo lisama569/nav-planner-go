@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/lisama569/nav-planner-go/pkg/grid"
 	"github.com/lisama569/nav-planner-go/pkg/kinematics"
@@ -71,7 +72,32 @@ func main() {
 	bad3 := emptyNav.Plan(nav.Request{Seq: 105, Tick: 6, Start: start, Goal: goal})
 	printResult("⑤c 地图缺失", start, goal, bad3)
 
-	// 6) 确定性重放：同一事件序列在全新编排器上逐条比对必须一致
+	// 6) 入口一致性：同一世界状态下，一次性 Plan 与逐步 ReplanningStep 结论一致
+	fmt.Println("--- 入口一致性（同一世界状态） ---")
+	conNav := newNav()
+	must(conNav.ApplyMap(nav.MapUpdate{Seq: 1, Grid: base}), "load map #2")
+	must(conNav.ApplyObstacle(nav.ObstacleUpdate{Seq: 2, Obstacle: mover}), "inject mover #2")
+	creq := nav.Request{Seq: 200, Tick: 10, Start: start, Goal: goal}
+	cp := conNav.Plan(creq)
+	printResult("⑥a 一次性入口 Plan（障碍已知）", start, goal, cp)
+	cs := conNav.ReplanningStep(creq)
+	printResult("⑥b 逐步推进入口 ReplanningStep（障碍已知）", start, goal, cs)
+	fmt.Printf("  一致性: 状态相同=%v, 路径相同=%v\n\n", cp.Status == cs.Status, samePath(cp.Path, cs.Path))
+
+	// 7) 可配置墙钟兜底：超时是可区分的“超时/未完成”类结论，不下发半成品
+	fmt.Println("--- 墙钟兜底时限（可选，默认禁用=完全确定性） ---")
+	toNav := newNav()
+	must(toNav.ApplyMap(nav.MapUpdate{Seq: 1, Grid: base}), "load map #3")
+	toNav.SetOptions(nav.Options{PlanTimeout: time.Nanosecond})
+	to := toNav.Plan(nav.Request{Seq: 300, Tick: 20, Start: start, Goal: goal})
+	printResult("⑦a 兜底时限=1ns（必然超时）", start, goal, to)
+	fmt.Printf("  超时分类: errors.Is(reason, nav.ErrPlanTimeout)=%v, 路径=%d, 轨迹=%v\n\n",
+		errors.Is(to.Reason, nav.ErrPlanTimeout), len(to.Path), to.Traj != nil)
+	toNav.SetOptions(nav.Options{}) // 恢复默认确定性模式
+	to2 := toNav.Plan(nav.Request{Seq: 301, Tick: 21, Start: start, Goal: goal})
+	printResult("⑦b 恢复默认（禁用兜底）", start, goal, to2)
+
+	// 8) 确定性重放：同一事件序列在全新编排器上逐条比对必须一致
 	fmt.Println("--- 确定性重放校验 ---")
 	rec := replay.NewRecorder(newNav())
 	rec.Apply(replay.Event{Tick: 1, Kind: replay.EventMap, Map: base})
@@ -103,6 +129,18 @@ func countOccupied(g *grid.Grid) int {
 		}
 	}
 	return n
+}
+
+func samePath(a, b []grid.Cell) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func must(err error, what string) {

@@ -14,4 +14,8 @@ var (
 	ErrConstraintViolation = errors.New("nav: trajectory violates kinematic constraints")
 	// ErrNoPlanner 表示编排器缺少必要的规划器组件。
 	ErrNoPlanner = errors.New("nav: planner not configured")
+	// ErrPlanTimeout 表示触发可选的墙钟兜底时限；结论分类为 StatusPlanLimit，
+	// 与确定性预算耗尽（planner.ErrPlanLimit）同属“超时/未完成”类，
+	// 可用 errors.Is(reason, ErrPlanTimeout) 区分触发来源。不下发任何路径/轨迹。
+	ErrPlanTimeout = errors.New("nav: planning time limit exceeded")
 )

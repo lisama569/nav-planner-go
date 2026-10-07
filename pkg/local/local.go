@@ -215,6 +215,12 @@ func (p *Planner) carrot(start kinematics.Pose, path []grid.Cell) grid.Cell {
 	return path[aim]
 }
 
+// CollidesAt 判断单个位姿是否侵入任一障碍物（半径+安全裕度）。
+// 供 nav 层对“最终交付轨迹”逐点做整体复核使用。
+func (p *Planner) CollidesAt(pose kinematics.Pose, obstacles []Obstacle) bool {
+	return p.clearance(pose, obstacles) < 0
+}
+
 // Collides 判断给定轨迹是否与任一障碍物（或占据栅格）碰撞。
 func (p *Planner) Collides(traj *kinematics.Trajectory, g *grid.Grid, obstacles []Obstacle) bool {
 	if traj == nil {
